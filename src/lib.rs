@@ -64,6 +64,17 @@ impl<T> AtomicArc<T> {
         }
     }
 
+    fn compare_exchange_ptr(&self, current: *mut T, new: *mut T) -> Result<Arc<T>, ()> {
+        match self
+            .ptr
+            .compare_exchange(current, new, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            // Safety: Original arc is always created with 'into_raw'
+            Ok(prev) => unsafe { Ok(Arc::from_raw(prev)) },
+            Err(curr) => Err(()),
+        }
+    }
+
     /// Replace the current value, dropping the previously stored [`Arc`].
     pub fn store(&self, arc: Arc<T>) {
         let _ = self.swap(arc);
@@ -77,6 +88,28 @@ impl<T> AtomicArc<T> {
         let raw = Arc::into_raw(arc) as *mut _;
 
         self.swap_ptr(raw)
+    }
+
+    /// Replace the current value, if it is the same as the `current` argument
+    /// The result indicates if the new value was written. On success this value is always equal to
+    /// current, otherwise is returns the currently contained value
+    ///
+    /// The returned [`Arc`] may have additional reference still held by other load calls
+    pub fn compare_exchange(&self, current: Arc<T>, new: Arc<T>) -> Result<Arc<T>, ()> {
+        let current_raw = Arc::into_raw(current) as *mut T;
+        let new_raw = Arc::into_raw(new) as *mut T;
+
+        match self.compare_exchange_ptr(current_raw, new_raw) {
+            Ok(prev) => {
+                let _ = unsafe { Arc::from_raw(current_raw) };
+                Ok(prev)
+            }
+            Err(_) => {
+                let _ = unsafe { Arc::from_raw(new_raw) };
+                let _ = unsafe { Arc::from_raw(current_raw) };
+                Err(())
+            }
+        }
     }
 }
 
@@ -139,6 +172,27 @@ mod tests {
 
         t1.join().unwrap();
         t2.join().unwrap();
+    }
+
+    #[test]
+    fn compare_exchange_success() {
+        let arc = AtomicArc::new(Arc::new(1));
+        let original = arc.load();
+        let new = Arc::new(2);
+        match arc.compare_exchange(original.clone(), new) {
+            Ok(old) => assert_eq!(old, original),
+            Err(_) => panic!("Compare exchange somehow failed"),
+        }
+    }
+    #[test]
+    fn compare_exchange_failure() {
+        let arc = AtomicArc::new(Arc::new(1));
+        let original = arc.load();
+        let new = Arc::new(2);
+        match arc.compare_exchange(new.clone(), new.clone()) {
+            Ok(_) => panic!("Compare exchange succeded when it should have failed"),
+            Err(()) => (),
+        }
     }
 }
 
